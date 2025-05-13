@@ -1,0 +1,171 @@
+// Load environment variables from .env file
+require("dotenv").config();
+
+// Import necessary libraries
+const express = require("express");
+const axios = require("axios");
+const cheerio = require("cheerio");
+const OpenAI = require("openai");
+const sgMail = require("@sendgrid/mail");
+const fs = require("fs");
+const { Document, Packer, Paragraph, HeadingLevel } = require("docx");
+
+// Initialize Express app
+const app = express();
+const PORT = 3030;
+
+// Initialize OpenAI with API key
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
+
+// Initialize SendGrid with API key
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+
+// === MAIN ROUTE: Fetch, summarize, create doc, and send email ===
+
+
+// app.get("/", async (req, res) => {});
+app.get("/", async (req, res) => {
+  const url = "https://www.si.com/nba"; // Source site for NBA articles
+  const headers = { "User-Agent": "Mozilla/5.0" };
+
+  try {
+    // Scrape the website
+    const response = await axios.get(url, { headers });
+    const $ = cheerio.load(response.data);
+
+    // Select top 10 article elements
+    const articles = $("div.padding_73yipz-o_O-wrapper_1tpwrvm article").slice(0, 10);
+    const newsList = [];
+
+    // Extract headline and link for each article
+    articles.each((_, el) => {
+      const titleTag = $(el).find("a.articleLink_1iblg8d");
+      const title = titleTag.attr("title") || "No Title";
+      const link = titleTag.attr("href") || "No URL";
+      if (title && link) {
+        newsList.push({ headline: title, link });
+      }
+    });
+
+    // ======= Summarize Articles =======
+    // Use OpenAI to summarize each article
+    const summaries = [];
+    for (const item of newsList) {
+      const summary = await summarizeArticle(item.headline, item.link);
+      summaries.push(summary);
+    }
+
+    // Generate a Word document with the summaries
+    const filePath = await createDocx(newsList, summaries);
+
+    // Send the document as an email attachment
+    await sendEmailWithAttachment(filePath);
+
+    // Respond to client
+    res.json({ status: "200", message: "News articles summarized and emailed successfully!" });
+  } catch (error) {
+    console.error("Error in main route:", error);
+    res.status(500).json({ status: "500", message: "Something went wrong." });
+  }
+});
+
+// === Summarize Article using OpenAI ===
+async function summarizeArticle(title, link) {
+  const prompt = `Summarize the following sports news article entitled "${title}" from Sports Illustrated in a conversational yet professional tone (preferably 3-4 sentences). The full article can be found at ${link}. Aim for clarity, brevity, and informativeness. Ideal for inclusion in a daily news digest.`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [
+        { role: "system", content: "You are a helpful assistant." },
+        { role: "user", content: prompt }
+      ]
+    });
+
+    if (
+      response &&
+      response.choices &&
+      response.choices.length > 0 &&
+      response.choices[0].message
+    ) {
+      return response.choices[0].message.content;
+    } else {
+      console.error("Invalid OpenAI response:", response);
+      return "Summary not available.";
+    }
+  } catch (err) {
+    console.error("OpenAI API error:", err);
+    return "Error summarizing article.";
+  }
+}
+
+// === Create Word Document from Summaries ===
+async function createDocx(newsList, summaries) {
+  const doc = new Document({
+    creator: "NBA Bot",
+    title: "Daily NBA News Digest",
+    description: "A daily summary of NBA news articles.",
+    sections: [
+      {
+        children: [
+          new Paragraph({
+            text: "Daily NBA News Digest",
+            heading: HeadingLevel.TITLE
+          }),
+          ...summaries.map((summary, i) => [
+            new Paragraph({
+              text: `News ${i + 1}: ${newsList[i].headline}`,
+              heading: HeadingLevel.HEADING_2
+            }),
+            new Paragraph({ text: `Link: ${newsList[i].link}` }),
+            new Paragraph({
+              text: "Summary:",
+              heading: HeadingLevel.HEADING_3
+            }),
+            new Paragraph(summary),
+            new Paragraph("--------------------------------------------------------------------------------")
+          ]).flat()
+        ]
+      }
+    ]
+  });
+
+  const buffer = await Packer.toBuffer(doc);
+  const fileName = "DailyNewsDigestNBA.docx";
+  fs.writeFileSync(fileName, buffer);
+  return fileName;
+}
+
+// === Send Email with Word Document Attached ===
+async function sendEmailWithAttachment(filePath) {
+  const fileData = fs.readFileSync(filePath).toString("base64");
+
+  const msg = {
+    to: process.env.RECIPIENT_EMAIL,
+    from: process.env.SENDER_EMAIL,
+    subject: `Daily NBA News Digest - ${new Date().toLocaleString()}`,
+    html: `<p>Here is your daily NBA news digest, generated by your Node.js bot 😎</p>`,
+    attachments: [
+      {
+        content: fileData,
+        filename: "DailyNewsDigestNBA.docx",
+        type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        disposition: "attachment"
+      }
+    ]
+  };
+
+  try {
+    await sgMail.send(msg);
+    console.log("✅ Email sent successfully!");
+  } catch (err) {
+    console.error("❌ SendGrid error:", err);
+  }
+}
+
+// === Start the Express Server ===
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
